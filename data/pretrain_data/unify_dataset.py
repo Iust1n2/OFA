@@ -26,8 +26,23 @@ warnings.filterwarnings("ignore", "(Possibly )?corrupt EXIF data", UserWarning)
 
 
 def get_whole_word_mask(bpe, dictionary):
-    if bpe is not None:
+    """
+    Returns a mask indicating whether each token in the dictionary is the beginning of a whole word.
 
+    Args:
+        bpe (object): The BPE (Byte Pair Encoding) object used for tokenization.
+        dictionary (list): The list of tokens in the dictionary.
+
+    Returns:
+        torch.ByteTensor or None: A mask indicating whether each token is the beginning of a whole word.
+            If `bpe` is None, returns None.
+
+    Raises:
+        ValueError: If an error occurs while checking if a token is the beginning of a word.
+
+    """
+    if bpe is not None:
+        
         def is_beginning_of_word(i):
             if i < dictionary.nspecial:
                 # special elements are always considered beginnings
@@ -48,6 +63,30 @@ def get_whole_word_mask(bpe, dictionary):
 
 
 def collate(samples, pad_idx, eos_idx):
+    """
+    Collates a list of samples into a batch.
+
+    Args:
+        samples (list): A list of samples, where each sample is a dictionary.
+        pad_idx (int): The index used for padding tokens.
+        eos_idx (int): The index used for end-of-sentence tokens.
+
+    Returns:
+        dict: A dictionary representing the batch, containing the following keys:
+            - "id": An array of sample IDs.
+            - "nsentences": The number of sentences in the batch.
+            - "ntokens": The total number of tokens in the batch.
+            - "net_input": A dictionary containing the following keys:
+                - "src_tokens": A tensor representing the source tokens.
+                - "src_lengths": A tensor representing the lengths of the source tokens.
+                - "patch_images": A tensor representing the patch images.
+                - "patch_masks": A tensor representing the patch masks.
+                - "code_masks": A tensor representing the code masks (optional).
+                - "prev_output_tokens": A tensor representing the previous output tokens (optional).
+            - "target": A tensor representing the target tokens (optional).
+            - "conf": A tensor representing the confidence scores.
+
+    """
     if len(samples) == 0:
         return {}
 
@@ -199,7 +238,7 @@ class UnifyDataset(OFADataset):
 
         scales = np.arange(patch_image_size, 481).tolist()
 
-        # for image-text pair
+        # transforms for image-text pair
         self.patch_resize_transform = transforms.Compose([
             T.RandomResize(scales, max_size=672),
             transforms.CenterCrop(patch_image_size),
@@ -208,19 +247,19 @@ class UnifyDataset(OFADataset):
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
-        # for pure image
+        # transforms for pure image
         self.patch_crop_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
-        # for detection
+        # transforms for detection
         self.detection_transform = T.Compose([
             T.RandomHorizontalFlip(),
             T.LargeScaleJitter(output_size=self.code_image_size*2, aug_scale_min=1.0, aug_scale_max=1.5),
             T.ToTensor(),
             T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], max_image_size=max_image_size)
         ])
-        # for visual grounding
+        # transforms for visual grounding
         self.visual_grounding_transform = T.Compose([
             T.RandomResize(scales, max_size=672),
             T.ObjectCenterCrop((patch_image_size, patch_image_size)),
@@ -232,6 +271,16 @@ class UnifyDataset(OFADataset):
         self.epoch = epoch
 
     def get_negative_caption(self, caption, gt_objects):
+        """
+        Generates a negative caption based on the given caption and ground truth objects.
+
+        Args:
+            caption (str): The original caption.
+            gt_objects (str): The ground truth objects.
+
+        Returns:
+            str: The generated negative caption.
+        """
         prob = random.random()
         if gt_objects is not None and gt_objects != '' and prob > 0.6:
             gt_object = random.choice(gt_objects.strip().split('&&'))
@@ -243,6 +292,16 @@ class UnifyDataset(OFADataset):
         return negative_caption
 
     def get_negative_answer(self, answer, conf):
+        """
+        Generates a negative answer based on the given answer and confidence level.
+
+        Args:
+            answer (str): The original answer.
+            conf (float): The confidence level.
+
+        Returns:
+            str: The generated negative answer.
+        """
         prob = random.random()
         if conf > (prob + 0.1) and answer in self.ans2type_dict:
             negative_answer_type = self.ans2type_dict[answer]

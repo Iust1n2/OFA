@@ -64,7 +64,7 @@ from `pretrain_ofa_base.sh` the order of tasks is:
 6. save path
 7. running the pretraining script
 
-## Step 5. Data preprocessing and preparation
+# Step 5. Data preprocessing and preparation
 
 `unify_dataset` in /pretrain_data is the script responsible for the data preparation for pretraining. It uses the modules from /data `data_utils.py, ofa_dataset.py` and from /utils `transforms.py, vision_helper.py`: 
 
@@ -346,7 +346,7 @@ class TransformerModel(FairseqEncoderDecoderModel)
 ```
 `FairseqEncoderDecoder` model is the actual backbone 
 
-## Positional Embedding
+## Sinusoidal Positional Embedding
 
 For positional embeddings is used the class `SinusoidalPositionalEmbedding` with args (embedding_dim, padding_idx, init_size = 1024) and ignores padding symbols, from fairseq/modules/sinusoidal_positional_embeddings.py. `get_embedding` method uses several key aspects: 
 - halving the embedding because summing up each sine and cos embedding (chatgpt explanation: "The embedding dimension is halved (half_dim) because each position's embedding will consist of a pair of sine and cosine values, thus effectively doubling the embedding size when concatenated")
@@ -367,7 +367,7 @@ completion of steps for data and multi modality handling and unification
 
 Running inference with OFA Base with HuggingFace Transformers in this [link](https://colab.research.google.com/drive/1Ho81RBV8jysZ7e0FhsSCk_v938QeDuy3?usp=sharing). Did not work error `unauthorized access for huggingface login` on colab.
 
-### OFAModel class - ofa.py
+## OFAModel class - ofa.py
 
 in `ofa.py` in ln 26 `OFAModel(TransformerModel)` class is initialized with BERT's random weights - from `fairseq/transformer_sentence_encoder.py`:
 
@@ -775,7 +775,9 @@ if key_padding_mask is not None and key_padding_mask.dim() == 0:
 
 Back to `TransformerEncoderLayer` after `build_self_attention` that returns MultiheadAttention illustrated before, there are employed methods for residual connections, state dict update and forward pass - lines 222-292: 
 
-In `unify_transformer.py` after method `build_encoder_layer` which consists of the `TransformerEncoderLayer` class i just presented, the code proceeds to methods for getting the relative positional bias for text and image in lines 722-744. 
+In `unify_transformer.py` after method `build_encoder_layer` which consists of the `TransformerEncoderLayer` class I just presented, the code proceeds to methods for getting the relative positional bias for text and image in lines 722-744. 
+
+#### Positional Embedding for Text and Images
 
 Then, `get_patch_images_info` fn employs the following: 
 
@@ -789,7 +791,7 @@ Then, `get_patch_images_info` fn employs the following:
 2. Generating patch positions: 
     - Calculates the number of patches `image_num_patches` based on the height (h) and width (w) of the embedded image
     - A padding mask `image_padding_mask` is created for the patches, initialized to zeros (and converted to boolean values), indicating no padding initially
-    - Positional indices `image_position_idx` for each patch are generated based on their order in the image grid and possibly adjusted by `self.args.image_bucket_size`, indicating a scaled positional encoding. The + 1 suggests that positions are 1-indexed
+    - Positional indices `image_position_idx` for each patch are generated based on their order in the image grid and possibly adjusted by `self.args.image_bucket_size`, indicating a scaled positional encoding. The + 1 suggests that positions are 1-indexed. The `image_position_ids` is resulted by expanding `image_position_idx` by added an extra dimension - the expand method is creating a new tensor where the image position indices are repeated for each item in the batch. The resulting tensor has shape `batch_size, image_num_patches`, and it contains the same image position indices for each item in the batch.
 
 3. Flattening and transposing - The embedded patches are flattened and transposed to have a shape suitable for processing by subsequent layers `image_embed = image_embed.flatten(2).transpose(1, 2)`, typically making the sequence of patches the primary dimension
 
@@ -829,6 +831,70 @@ For **image token** embedding:
 - **Concatenation**: The processed image embeddings are concatenated with the textual token embeddings, merging visual and textual information into a single sequence. This concatenated **sequence (x)** and **its embedding (embed)** are returned, (!) now unified in a single embedding space.
 
 Next, the `forward` is employed which uses the `forward_scriptable` method in lines 872-1078:
+
+Takes as input tokens in the source language and their lengths in `src_tokens` and `src_lengths`, token embeddings and `return_all_hidden_states` and returns a dictionary of the last encoder output shape of `(src_len, batch, embed_dim)` in `encoder_out`, the positions of the padding elements of shape `(batch, src_len)` in `encoder_padding_mask`, the encoder embedding lookup of shape  `(src_len, batch, embed_dim)` in `encoder_embedding` and all intermediate hidden states of shape `(src_len, batch, embed_dim)` in `encoder_states`.
+
+`forward_scriptable` fn actually performs the forward pass:
+
+- inputs and outputs the same as `forward` above
+- uses methods `get_encoder_prompt` and `get_patch_images_info` for token embedding for text and images
+- then applies positional encoding with `forward_embedding` method for unification in lines 990
+- applies the positional encoding (lines 1000-1050) as described in the paper: 
+    1. "For positional information, we use two absolute position embeddings for text and images, respectively ... In addition, we also use 1D relative position bias for text and 2D relative position bias for image"
+    2. "Instead of simply adding the position embeddings, we decoupling the position correlation from token embeddings and patch embeddings"
+
+i. code snippet
+```
+# lines 1011
+## absolute position embedding 
+pos_q = self.pos_q_linear(pos_embed).view(
+    pos_embed.size(0), pos_embed.size(1), self.num_attention_heads, -1
+).transpose(1, 2) * self.pos_scaling
+pos_k = self.pos_k_linear(pos_embed).view(
+    pos_embed.size(0), pos_embed.size(1), self.num_attention_heads, -1
+).transpose(1, 2)
+abs_pos_bias = torch.matmul(pos_q, pos_k.transpose(2, 3))
+
+# lines 1027
+## first for text (src_tokens)
+for idx, layer in enumerate(self.layers):
+            self_attn_bias = abs_pos_bias.clone()
+            self_attn_bias[:, :, -
+                           src_tokens.size(1):, -
+                           src_tokens.size(1):] += self.get_rel_pos_bias(src_tokens, idx)
+            # then for image (image_position_ids)
+            if patch_images_2 is not None:
+                self_attn_bias[:, :, :image_num_patches_2, :image_num_patches_2] += \
+                    self.get_image_rel_pos_bias(image_position_ids_2, idx)
+                self_attn_bias[:, :, image_num_patches_2:image_num_patches_2 +
+                               image_num_patches, image_num_patches_2:image_num_patches_2 +
+                               image_num_patches] += self.get_image_rel_pos_bias(image_position_ids, idx)
+            elif patch_images is not None:
+                self_attn_bias[:, :, :x.size(0) - src_tokens.size(1), :x.size(
+                    0) - src_tokens.size(1)] += self.get_image_rel_pos_bias(image_position_ids, idx)
+            self_attn_bias = self_attn_bias.reshape(
+                -1, self_attn_bias.size(2), self_attn_bias.size(2))
+```
+    
+ii. code snippet
+```
+# line 640 
+## first step - token embedding for text
+self.embed_positions = Embedding(
+            args.max_source_positions + 2, embed_dim)
+# and for image
+self.embed_image_positions = Embedding(
+    args.image_bucket_size ** 2 + 1, embed_dim)
+
+# line 867 decoupeling embeddings
+x = torch.cat([image_x_2, x], dim=1)
+embed = torch.cat([image_embed_2, embed], dim=1)
+# line 990
+## decoupeling positional embeddings
+pos_embed = self.embed_positions(utils.new_arange(src_tokens))
+pos_embed = torch.cat([image_pos_embed, pos_embed], dim=1)
+# from which image_pos_embed is given from get_patch_image_info fn by extracting the positional information
+```
 
 
 

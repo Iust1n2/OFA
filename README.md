@@ -570,7 +570,7 @@ def ofa_base_architecture(args):
 
 UnifyTransformer is the builder for the unified model. Uses for layers of Encoder and Decoder fairseq classes: `FairseqEncoderDecoder` `FairseqEncoder` and `FairseqIncrementalDecoder`, which only defines the output of the Encoder and some modifiable methods for the forward pass and state dict update and beam search size. `FairseqIncrementalDecoder` is a special type of Decoder 
 
-#### Encoder
+### Encoder
 
 `TransformerEncoder(FairseqEncoder)`:
 
@@ -896,8 +896,162 @@ pos_embed = torch.cat([image_pos_embed, pos_embed], dim=1)
 # from which image_pos_embed is given from get_patch_image_info fn by extracting the positional information
 ```
 
+After applying positional encoding proceeds to append `x` - which is transposed(B x T x C -> T x B x C) before decoupling positional encoding for text and image in ```if return_all_hiddens:
+            encoder_states.append(x)```. 
+            
+Then, if there's a `prompt_padding_mask` it's concatenated with `encoder_padding_mask`. This step combines the padding information from prompt tokens with that of the original input tokens, ensuring that attention mechanisms within the encoder ignore both prompt and input padding tokens correctly.
+
+Then, in lines 1027 iterates over each layer of the encoder: 
+#### Encoder Layer processing 
+- A copy of `abs_pos_bias` is modified with relative positional bias for self-attention. This bias adjustment is specific to the input tokens and potentially different image inputs.
+- If there are second set of patch images `patch_images_2`, or just one set of patch images `patch_images`, their relative positional biases are also calculated and added. This allows the model to incorporate spatial relationships within and across images and between images and textual tokens.
+- The `self_attn_bias` is reshaped to match the expected dimensionality for the attention operation.
+- If encoder prompts are being used `self.args.encoder_prompt`, the `prompt_kv` (key-value pairs for the prompt) is prepared differently based on the encoder layer and the type of prompt mechanism employed.
+- The layer is then called with the current state `x`, any applicable padding mask, the self-attention bias, and the prompt key-value pairs.
+- If `return_all_hiddens` is True, the output of each layer is added to `encoder_states`
+- Final layer normalization
+- Adjusting Encoder Padding Mask: If encoder prompts are used, the encoder_padding_mask is adjusted to exclude the prompt tokens. This ensures that any downstream processing doesn't mistakenly consider prompt tokens as part of the original sequence for tasks like sequence generation or classification.
+- Returns a dictionary with keys mapping to various outputs like `encoder_out`, `encoder_padding_mask`, and optionally `encoder_states` and `position_embeddings`
+
+Then some additional methods are defined - `reorder_encoder_out`, `max_positions`, `update_state_dict_named`
 
 
+### Decoder
+
+In lines 1200 in `unify_transformer.py` the Decoder class is defined, which inherits from the Fairseq class `FairseqIncrementalDecoder`.
+
+Fairseq Incremental Decoder: 
+
+Incremental decoding is a special mode at inference time where the Model only receives a single timestep of input corresponding to the previous output token (for teacher forcing) and must produce the next output *incrementally*. Thus the model must cache any long-term state that is needed about the sequence, e.g., hidden states, convolutional states, etc.
+Compared to the standard :class:`FairseqDecoder` interface, the incremental decoder interface allows :func:`forward` functions to take an extra keyword argument (*incremental_state*) that can be used to cache state across time-steps.
+The :class:`FairseqIncrementalDecoder` interface also defines the :func:`reorder_incremental_state` method, which is used during beam search to select and reorder the incremental state based on the selection of beams.
+To learn more about how incremental decoding works, refer to [this blog](http://www.telesens.co/2019/04/21/understanding-incremental-decoding-in-fairseq/).
+
+`TransformerDecoder` is initialized with `dictionary`, `embed_tokens` and `no_encoder_attn` - whether to attent to encoder outputs.
+
+`if getattr(args, "decoder_prompt", False)`: checks if the attribute decoder_prompt exists within the args object and evaluates to True. This condition determines whether or not the decoder will utilize a prompt mechanism as part of its processing. If the condition is met, this line initializes a `PromptEncoder` object as part of the decoder. The PromptEncoder is configured with several parameters from `args`: 
+- `type`: The type of prompt, which could dictate how the prompt is generated or applied within the model.
+- `length`: The length of the prompt, determining how many tokens or embeddings are considered part of the prompt.
+- `projection`: Whether or not a projection layer is used to align the prompt embeddings with the decoder's embeddings or the task-specific feature space.
+- `embed_dim`: The dimensionality of the embeddings within the decoder, which the prompt's embeddings might need to match or interact with.
+- `proj_dim`: The dimensionality of the projection for the prompt, if a projection layer is used.
+- `layers`: The number of layers in the decoder, which could influence how prompts are integrated or propagated through the decoder.
+- `vocab_size`: The size of the vocabulary, which could be relevant if the prompt mechanism involves generating or manipulating tokens directly.
+
+Then defines some other useful args: `decoder_layerdrop, share_input_output_embed, num_attention_heads, input_embed_dim, embed_dim - from decoder_embed_dim, output_embed_dim - from decoder_output_dim, padding_idx, max_target_positions and embed_tokens`. 
+
+Then in lines 1284-1984, 1. positional embeddings, 2. layer normalization, 3. positional scaling and 4. linear transforms for Queries, Keys and Values are defined: 
+
+1. 
+- `self.embed_positions`: This is an embedding layer for encoding the positions of tokens in the input sequence. It uses args.max_target_positions + 2 as the total number of positions it can encode, which allows the model to understand the order of tokens. The +2 likely accounts for special tokens or padding.
+- `self.embed_image_positions`: Similar to self.embed_positions, but specifically for encoding positions within images. The total number of positions args.image_bucket_size ** 2 + 1 suggests that image positions are conceptualized in a 2D grid (hence the square), and +1 again might be for special considerations like padding or a special token
+
+3. `self.pos_scaling`: This calculates a scaling factor for attention scores, inversely proportional to the square root of the dimensionality of the attention head times an attn_scale_factor. This scaling helps manage the magnitude of attention scores, making training more stable
+
+4. 
+- `self.self_pos_q_linear` and `self.self_pos_k_linear:` These linear layers are used to transform embedded positions into queries (q) and keys (k) for self-attention mechanisms. This transformation allows the model to calculate attention scores based on positional relationships within the same modality (text-to-text or image-to-image).
+- `self.cross_pos_q_linear` and `self.cross_pos_k_linear`: Similar to the self-attention position linear transformations, these are used for cross-attention mechanisms, where the positionally transformed queries from one modality (text) are used to attend to keys from another modality (images).
+
+Then, the initialization of the Decoder layers: The code dynamically extends `self.layers` with decoder layers created by `self.build_decoder_layer`. Each layer is instantiated with a specific dropout rate from `dpr` (Drop Path Rate, declared just earlier), determined by its position in the sequence of layers.
+
+Project Output Dimension: 
+
+- `self.project_out_dim` is conditionally initialized to perform a linear transformation from the decoder's embedding dimension to the output embedding dimension 
+- `self.output_embed_dim`, but only if the two dimensions differ and adaptive weights are not tied. This transformation is necessary when the dimensions of the internal representations don't match the expected size of the model's outputs.
+
+**Output Projection:** 
+
+- initialization of `self.output_projection`, which is responsible for mapping the decoder's output to the final output space
+
+**Relative Positional Embeddings for Tokens:**
+
+- initializes a list of embeddings `self.token_rel_pos_table_list` for encoding relative positional information between tokens 
+```
+self.token_rel_pos_table_list = nn.ModuleList(
+            [
+                Embedding(
+                    token_num_rel_dis,
+                    self.num_attention_heads,
+                    zero_init=True) for _ in range(
+                    args.decoder_layers)])
+```
+- The size of this embedding space `token_num_rel_dis` is determined based on a calculated range of relative distances `token_bucket_size`, and `make_token_bucket_position` likely generates a mapping or categorization of relative distances into bucket.
+
+**Relative Positional Embeddings for Images:** 
+
+- does the same for images - list of embeddings `self.image_rel_pos_table_list`:
+```
+self.image_rel_pos_table_list = nn.ModuleList(
+            [
+                Embedding(
+                    image_num_rel_dis,
+                    self.num_attention_heads,
+                    zero_init=True) for _ in range(
+                    args.decoder_layers)])
+```
+- The size of the image embedding space `image_num_rel_dis = (2 * image_bucket_size - 1) * \ (2 * image_bucket_size - 1) + 3` 
+- Defines the `image_rp_bucket` which calculates a range of relative distances between `image_bucket_size` and `image_num_rel_distance` and applying `make_image_bucket_position` fn over these two args: 
+```
+def make_image_bucket_position(bucket_size, num_relative_distance):
+    coords_h = torch.arange(bucket_size)
+    coords_w = torch.arange(bucket_size)
+    coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+    coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+    relative_coords = coords_flatten[:, :, None] - \
+        coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+    relative_coords = relative_coords.permute(
+        1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+    relative_coords[:, :, 0] += bucket_size - 1  # shift to start from 0
+    relative_coords[:, :, 1] += bucket_size - 1
+    relative_coords[:, :, 0] *= 2 * bucket_size - 1
+    relative_position_index = torch.zeros(
+        size=(
+            bucket_size * bucket_size + 1,
+        ) * 2,
+        dtype=relative_coords.dtype)
+    relative_position_index[1:, 1:] = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+    relative_position_index[0, 0:] = num_relative_distance - 3
+    relative_position_index[0:, 0] = num_relative_distance - 2
+    relative_position_index[0, 0] = num_relative_distance - 1
+    return relative_position_index
+```
+
+Then registers `token_rp_bucket`, `image_rp_bucket, image_position_idx` and defines (!) `self.entangle_position_embedding`, which was also used in the `forward_embedding` for raw text tokens and raw images method of Encoder and in the Positional Encoding of the tokens described before. 
+
+Then the `get_decoder_prompt` fn is declared the same as for Encoder.
 
 
+Then `build_output_projection` fn is responsible for setting up the final projection layer or mechanism in a transformer-based model's decoder that maps the decoder's output embeddings to a vocabulary space which. It takes as args `dictionary` and `embed_tokens`. 
+
+**Adaptive Softmax:**
+
+`AdaptiveSoftmax` is a class from `adaptive_softmax.py` which follows the implementation of this [paper](https://arxiv.org/pdf/1609.04309). Adaptive Softmax is an efficient way to compute softmax over a large vocabulary. It is particularly useful for models with very large vocabularies because it reduces the computational burden by dividing the vocabulary into clusters, typically with fewer clusters for more frequent words and more clusters for less frequent words. The parameters are:
+```
+self.adaptive_softmax = AdaptiveSoftmax(
+                len(dictionary),
+                self.output_embed_dim,
+                utils.eval_str_list(
+                    args.adaptive_softmax_cutoff,
+                    type=int),
+                dropout=args.adaptive_softmax_dropout,
+                adaptive_inputs=embed_tokens if args.tie_adaptive_weights else None,
+                factor=args.adaptive_softmax_factor,
+                tie_proj=args.tie_adaptive_proj,
+            )
+```
+**Shared Input-Output Embeddings**: 
+
+If `args.adaptive_softmax_cutoff` is not provided but `self.share_input_output_embed` is True, it indicates that the input embeddings (used at the beginning of the model for the input tokens) should be reused as the output projection layer. This approach is efficient and can help improve performance by tying the input and output representations. In this case, a linear transformation layer is created with its weight tied to the `embed_tokens weights`, ensuring the input and output embedding spaces are the same.
+
+**Standard Linear Projection:**
+
+If neither of the above conditions are met, a standard linear projection layer is initialized. This layer maps the output embedding dimension to the vocabulary size without any clustering or weight sharing optimizations. The weights of this layer are initialized with a normal distribution, scaled by the inverse square root of the output embedding dimension
+
+**Base Layers Insertion:**
+
+Finally the function potentially inserts additional base layers `BaseLayer` into the decoder. The number of these layers and their positions are determined by `args.base_layers` and the total number of decoder layers `args.decoder_layer`
+
+**Decoder Layer:**
+
+Then in ln 1428 `build_decoder_layer` creates a `layer` from the class `TransformerDecoderLayer` from `unify_transformer_layer.py` - ln 296
 

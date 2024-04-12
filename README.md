@@ -1055,3 +1055,284 @@ Finally the function potentially inserts additional base layers `BaseLayer` into
 
 Then in ln 1428 `build_decoder_layer` creates a `layer` from the class `TransformerDecoderLayer` from `unify_transformer_layer.py` - ln 296
 
+`TransformerDecoderLayer` is initialized with `embed_dim, use_adapter` - `if use_adapter == True: self.adapter = AdapterLayer(d_model=self.embed_dim, down_size=adapter_dim)` with an `adapter_dim=200`:
+
+```
+class Adapter_Layer(torch.nn.Module):
+    def __init__(self,
+                 d_model=None,
+                 down_size=None,
+                 dropout=0.0,
+                 init_option="bert",
+                 adapter_scalar="1.0"):
+        super().__init__()
+        self.n_embd = d_model
+        self.down_size = down_size
+
+
+        if adapter_scalar == "learnable_scalar":
+            self.scale = nn.Parameter(torch.ones(1))
+        else:
+            self.scale = float(adapter_scalar)
+
+        self.down_proj = nn.Linear(self.n_embd, self.down_size)
+        self.non_linear_func = nn.ReLU()
+        self.up_proj = nn.Linear(self.down_size, self.n_embd)
+
+        self.dropout = dropout
+        if init_option == "bert":
+            self.apply(init_bert_weights)
+        elif init_option == "lora":
+            with torch.no_grad():
+                nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
+                nn.init.zeros_(self.up_proj.weight)
+                nn.init.zeros_(self.down_proj.bias)
+                nn.init.zeros_(self.up_proj.bias)
+
+    def forward(self, x, add_residual=True, residual=None):
+        residual = x if residual is None else residual
+
+        down = self.down_proj(x)
+        down = self.non_linear_func(down)
+        down = nn.functional.dropout(down, p=self.dropout, training=self.training)
+        up = self.up_proj(down)
+        up = up * self.scale
+        if add_residual:
+            output = up + residual
+        else:
+            output = up
+
+        return output
+```
+
+`TransformerDecoderLayer` from `unify_transformer_layer.py`: 
+
+Starts with declaring attributes: `embed_dim`, `use_adapter`, `dropout_module`, `quant_noise`, `cross_self_attention`, `self_attn=self.build_self_attention()`, `self_attn_ln`, `cross_attn_ln`, `self.nh = self.self_attn.num_heads`, `self.head_dim = self.self_attn.head_dim`, `activation_fn=relu` and `activation_dropout`. Verifies if there isnt encoder attention and if there is builds it with `build_encoder_attention` ln 412 - returns `MultiheadAttention` of args: `embed_dim, decoder_attention_heads, attention_dropout, kdim and vdim of encoder_embed_dim, encoder_decoder_attention=True, q_noise, qn_block_size`, `scale_factor` and `scale_heads`. Then declares `ffn_layernorm` and `w_resid`.
+
+```
+def build_self_attention(
+        self, embed_dim, args, add_bias_kv=False, add_zero_attn=False
+    ):
+        return MultiheadAttention(
+            embed_dim,
+            args.decoder_attention_heads,
+            dropout=args.attention_dropout,
+            add_bias_kv=add_bias_kv,
+            add_zero_attn=add_zero_attn,
+            self_attention=not getattr(args, "cross_self_attention", False),
+            q_noise=self.quant_noise,
+            qn_block_size=self.quant_noise_block_size,
+            scale_factor=args.attn_scale_factor,
+            scale_heads=getattr(args, 'scale_heads', False)
+        )
+```
+
+`forward` pass: 
+
+```
+def forward(
+        self,
+        x,
+        encoder_out: Optional[torch.Tensor] = None,
+        encoder_padding_mask: Optional[torch.Tensor] = None,
+        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        prev_self_attn_state: Optional[List[torch.Tensor]] = None,
+        prev_attn_state: Optional[List[torch.Tensor]] = None,
+        self_attn_mask: Optional[torch.Tensor] = None,
+        self_attn_padding_mask: Optional[torch.Tensor] = None,
+        need_attn: bool = False,
+        need_head_weights: bool = False,
+        self_attn_bias: Optional[Tensor] = None,
+        cross_attn_bias: Optional[Tensor] = None,
+        prompt_kv: Optional[Tensor] = None
+    ):
+        """
+        Args:
+            x (Tensor): input to the layer of shape `(seq_len, batch, embed_dim)`
+            encoder_padding_mask (ByteTensor, optional): binary
+                ByteTensor of shape `(batch, src_len)` where padding
+                elements are indicated by ``1``.
+            need_attn (bool, optional): return attention weights
+            need_head_weights (bool, optional): return attention weights
+                for each head (default: return average over heads).
+
+        Returns:
+            encoded output of shape `(seq_len, batch, embed_dim)`
+        """
+```
+
+- first, returns attention weights for each head in `if need_head_weights: need_attn = True`
+- declares the residual variable as x and applies layer norm in `if self.normalize_before: x = self.self_attn_layer_norm(x)`
+- then checks `if prev_self_attn_state is Not None` and retrieves from it the `prev_key` and `prev_value` and saves them in the `saved_state` dict and then if the length of `prev_self_attn_state` is >= 3 meaning that if there is a third element in the prev state, the `prev_key_padding_mask` then it appends it to the `saved_state`
+    - **Incremental State Assertion and Buffer Management** - lines 473: If `incremental_state` is not None saves the `saved_state` of the self attention in the incremental state. Incremental state is typically used in Transformer models during inference, especially in sequence generation tasks like translation, where you generate one token at a time and keep track of previously computed states. `self.self_attn._set_input_buffer(incremental_state, saved_state) & _self_attn_input_buffer = self.self_attn._get_input_buffer(incremental_state)`. This essentially keeps the decoder at the incremental decoding step to avoid recomputing the attention states from scratch at every step and then it retrieves the current state of the input buffer, which contains necessary information for performing attention operations incrementally. 
+    -  **Cross-Self Attention Handling** - lines 478: It checks whether `cross_self_attention` is enabled and ensures that the necessary conditions for using previous keys and values from the buffer are not met (`incremental_state` is provided, buffer is not None, and it contains "prev_key"):
+        - **Adjusting Attention Masks and Padding Masks**: If there’s a `self_attn_mask`, it's expanded to accommodate the encoder's output length. This is done by concatenating zeros (representing the encoder's output positions) to the existing self-attention mask, effectively padding the mask to align with the combined sequence of encoder outputs and current decoder inputs.
+        - Similarly, if there's a `self_attn_padding_mask`, it’s also expanded. If `encoder_padding_mask` is not provided, a new one is created filled with zeros, indicating no padding initially for encoder outputs. This new mask or the existing `encoder_padding_mask` is then concatenated with the `self_attn_padding_mask` to handle the combined sequence.
+    - **Concatenation of Encoder Output and Current Input (y)**: If the conditions for using buffered states are not met, it concatenates the encoder's output `encoder_out` with the current input to the layer `x`. If the conditions are met (using buffered states), the layer simply uses the current input `x` as `y`.
+
+
+#### Mask Multi-Head Attention ln 502
+
+- `x, attn = self.self_attn()`: applies multi-head attention where the decoder's input sequence `x` queries the previous decoder layer output `y`   
+- applies layer norm, dropout and residual connection to `x` and finally stores into `saved_state` the prev keys and values
+
+#### Cross Attention ln 535
+
+- `x, attn = self.encoder_attn()`: applies multi-head attention where the decoder's current state `x` queries the encoder's output `encoder_out`
+- does the same as above
+
+After Mask Attention and Cross Attention `x` is passed through another Add & Norm and then through a Feed Forward Net and a final layer norm and the Decoder is ended.
+
+Back to the main class `TransformerDecoder`, after the Decoder layer is created - line 1428, are declared methods for getting the relative positional info `get_rel_pos_bias` - for text and `get_image_rel_pos_bias` - for images. Both use the `embedding` fn from `functional.py`: 
+
+```
+def embedding(
+    input: Tensor,
+    weight: Tensor,
+    padding_idx: Optional[int] = None,
+    max_norm: Optional[float] = None,
+    norm_type: float = 2.0,
+    scale_grad_by_freq: bool = False,
+    sparse: bool = False,
+) -> Tensor:
+    r"""A simple lookup table that looks up embeddings in a fixed dictionary and size.
+
+    This module is often used to retrieve word embeddings using indices.
+    The input to the module is a list of indices, and the embedding matrix,
+    and the output is the corresponding word embeddings.
+
+    See :class:`torch.nn.Embedding` for more details.
+
+    Args:
+        input (LongTensor): Tensor containing indices into the embedding matrix
+        weight (Tensor): The embedding matrix with number of rows equal to the maximum possible index + 1,
+            and number of columns equal to the embedding size
+        padding_idx (int, optional): If specified, the entries at :attr:`padding_idx` do not contribute to the gradient;
+                                     therefore, the embedding vector at :attr:`padding_idx` is not updated during training,
+                                     i.e. it remains as a fixed "pad".
+        max_norm (float, optional): If given, each embedding vector with norm larger than :attr:`max_norm`
+                                    is renormalized to have norm :attr:`max_norm`.
+                                    Note: this will modify :attr:`weight` in-place.
+        norm_type (float, optional): The p of the p-norm to compute for the :attr:`max_norm` option. Default ``2``.
+        scale_grad_by_freq (boolean, optional): If given, this will scale gradients by the inverse of frequency of
+                                                the words in the mini-batch. Default ``False``.
+        sparse (bool, optional): If ``True``, gradient w.r.t. :attr:`weight` will be a sparse tensor. See Notes under
+                                 :class:`torch.nn.Embedding` for more details regarding sparse gradients.
+
+    Shape:
+        - Input: LongTensor of arbitrary shape containing the indices to extract
+        - Weight: Embedding matrix of floating point type with shape `(V, embedding_dim)`,
+                            where V = maximum index + 1 and embedding_dim = the embedding size
+        - Output: `(*, embedding_dim)`, where `*` is the input shape
+
+    Examples::
+
+        >>> # a batch of 2 samples of 4 indices each
+        >>> input = torch.tensor([[1,2,4,5],[4,3,2,9]])
+        >>> # an embedding matrix containing 10 tensors of size 3
+        >>> embedding_matrix = torch.rand(10, 3)
+        >>> F.embedding(input, embedding_matrix)
+        tensor([[[ 0.8490,  0.9625,  0.6753],
+                 [ 0.9666,  0.7761,  0.6108],
+                 [ 0.6246,  0.9751,  0.3618],
+                 [ 0.4161,  0.2419,  0.7383]],
+
+                [[ 0.6246,  0.9751,  0.3618],
+                 [ 0.0237,  0.7794,  0.0528],
+                 [ 0.9666,  0.7761,  0.6108],
+                 [ 0.3385,  0.8612,  0.1867]]])
+
+        >>> # example with padding_idx
+        >>> weights = torch.rand(10, 3)
+        >>> weights[0, :].zero_()
+        >>> embedding_matrix = weights
+        >>> input = torch.tensor([[0,2,0,5]])
+        >>> F.embedding(input, embedding_matrix, padding_idx=0)
+        tensor([[[ 0.0000,  0.0000,  0.0000],
+                 [ 0.5609,  0.5384,  0.8720],
+                 [ 0.0000,  0.0000,  0.0000],
+                 [ 0.6262,  0.2438,  0.7471]]])
+    """
+
+    if padding_idx is not None:
+        if padding_idx > 0:
+            assert padding_idx < weight.size(0), "Padding_idx must be within num_embeddings"
+        elif padding_idx < 0:
+            assert padding_idx >= -weight.size(0), "Padding_idx must be within num_embeddings"
+            padding_idx = weight.size(0) + padding_idx
+    else:
+        padding_idx = -1
+    if max_norm is not None:
+        # Note [embedding_renorm contiguous]
+        # `embedding_renorm_` will call .contiguous() on input anyways, so we
+        # call it here and take advantage of the improved locality in the
+        # `embedding` call below too.
+        input = input.contiguous()
+        # Note [embedding_renorm set_grad_enabled]
+        # XXX: equivalent to
+        # with torch.no_grad():
+        #   torch.embedding_renorm_
+        # remove once script supports set_grad_enabled
+        _no_grad_embedding_renorm_(weight, input, max_norm, norm_type)
+    return torch.embedding(weight, input, padding_idx, scale_grad_by_freq, sparse)
+```
+The key differences between the two methods for relative position extraction for the `Values` is that the input and weight(embedding matrix) parameters differs from text to image, as for text it is used the `token_rel_pos_table_list[idx].weight` and for image - `image_rel_pos_table_list[idx].weight`
+
+Then, in `get_pos_info` lines 1465, the batch size and target length are extracted from `tokens` followed by layer norm. Next, it verifies if there exists `src_pos_embed` and if there is then proceeds to extract the source length and the positions of the Queries from the target positional embedding and Keys from the source positional embedding. Else, if there isnt a source positional embedding then the source length is extracted from the target embedding and the Queries and Keys from the same target embedding. Finally returns the absolute positional bias as `torch.matmul(pos_q, pos_k.transpose(2, 3))`.
+
+#### Forward Pass ln 1500
+
+```
+        """
+        Args:
+            prev_output_tokens (LongTensor): previous decoder outputs of shape
+                `(batch, tgt_len)`, for teacher forcing
+            encoder_out (optional): output from the encoder, used for
+                encoder-side attention, should be of size T x B x C
+            incremental_state (dict): dictionary used for storing state during
+                :ref:`Incremental decoding`
+            features_only (bool, optional): only return features without
+                applying output layer (default: False).
+            full_context_alignment (bool, optional): don't apply
+                auto-regressive mask to self-attention (default: False).
+
+        Returns:
+            tuple:
+                - the decoder's output of shape `(batch, tgt_len, vocab)`
+                - a dictionary with any model-specific outputs
+        """
+```
+
+The forward pass starts by applying a `extract_features` fn to `x` and `extra`. `extract_features` takes as input `previous_output_tokens, code_masks, encoder_out, incremental_state, full_context_alignment, alignment_heads and alignment_layer`. It returns the output over these employed by another scriptable subclass `extract_features_scriptable` - declared in lines 1565:
+
+```
+ """
+ def extract_features_scriptable(
+        self,
+        prev_output_tokens,
+        code_masks: Optional[torch.Tensor],
+        encoder_out: Optional[Dict[str, List[Tensor]]],
+        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        full_context_alignment: bool = False,
+        alignment_layer: Optional[int] = None,
+        alignment_heads: Optional[int] = None,
+    ):
+        Similar to *forward* but only return features.
+
+        Includes several features from "Jointly Learning to Align and
+        Translate with Transformer Models" (Garg et al., EMNLP 2019).
+
+        Args:
+            full_context_alignment (bool, optional): don't apply
+                auto-regressive mask to self-attention (default: False).
+            alignment_layer (int, optional): return mean alignment over
+                heads at this layer (default: last layer).
+            alignment_heads (int, optional): only average alignment over
+                this many heads (default: all heads).
+
+        Returns:
+            tuple:
+                - the decoder's features of shape `(batch, tgt_len, embed_dim)`
+                - a dictionary with any model-specific outputs
+        """
+```

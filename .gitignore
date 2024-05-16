@@ -1,3 +1,5 @@
 pretrain_data_examples.zip
 dataset/
 github_pat.md
+test_image_feature_extractor.ipynb
+test_image_feature_extractor.py

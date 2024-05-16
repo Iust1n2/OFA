@@ -779,6 +779,24 @@ In `unify_transformer.py` after method `build_encoder_layer` which consists of t
 
 #### Positional Embedding for Text and Images
 
+In ln 453, `build_embedding` is a function that creates the embedding layer used for the Encoder and Decoder for a given dictionary of words or tokens. The `embed_dim` argument is the size of the embedding vectors, which is default `512`, and the `path` argument is an optional path to a preloaded dictionary of embeddings. The function starts by getting the number of embeddings, which is the length of the dictionary. This function initializes the weights of the embedding layer with a normal distribution and sets the weights of the padding index to zero.
+
+If a path to a preloaded dictionary of embeddings is provided, the function loads the embeddings from this dictionary using the `parse_embedding` and `load_embedding` functions. The `parse_embedding` function reads the embeddings from a text file, where each line contains a word and its corresponding embedding vector. The `load_embedding` function then loads these embeddings into the embedding layer, replacing the initial weights for the words that are present in the preloaded dictionary:
+
+```
+def build_embedding(cls, args, dictionary, embed_dim, path=None):
+        num_embeddings = len(dictionary)
+        padding_idx = dictionary.pad()
+
+        args.vocab_size = num_embeddings
+        emb = Embedding(num_embeddings, embed_dim, padding_idx)
+        # if provided, load from preloaded dictionaries
+        if path:
+            embed_dict = utils.parse_embedding(path)
+            utils.load_embedding(embed_dict, dictionary, emb)
+        return emb
+```
+
 Then, `get_patch_images_info` fn employs the following: 
 
 1. Embeds image patches `image_embed = self.embed_images(patch_images)` and extracts the height and width with the ResNet vision module: `elif args.resnet_type == 'resnet101':

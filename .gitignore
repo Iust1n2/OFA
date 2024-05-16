@@ -1,2 +1,16 @@
 .idea/*
 .DS_Store
+github_pat.md
+examples/
+OFA-base/
+OFA-base-vqa/
+OFA-huge/
+OFA-huge-vqa/
+OFA-large/
+OFA-large-caption/
+OFA-medium/
+OFA-tiny/
+VL-Interpret/
+transformers/
+dataset/
+pretrain_data_examples.zip

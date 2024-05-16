@@ -564,7 +564,7 @@ class OFADecoderLayer(nn.Module):
         self.final_layer_norm = LayerNorm(self.embed_dim)
         self.normalize_before = config.decoder_normalize_before
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
-
+        
     def residual_connection(self, x, residual):
         r"""
         Residual connection with drop path.

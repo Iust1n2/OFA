@@ -1,7 +1,6 @@
 .idea/*
 .DS_Store
 github_pat.md
-examples/
 OFA-base/
 OFA-base-vqa/
 OFA-huge/
